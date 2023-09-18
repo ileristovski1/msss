@@ -50,6 +50,8 @@ contract MKDEngine is ReentrancyGuard {
     error MKDEngine__TokenAddressesAndPriceFeedADdressesMustBeSameLength();
     error MKDEngine__TokenIsNotAllowed();
     error MKDEngine__DepositCollateralFailed();
+    error MKDEngine_BreaksHealthFactor(uint256 healthFactor);
+    error MKDEngine__MintFailed();
 
     /**
      * State Variables
@@ -57,6 +59,10 @@ contract MKDEngine is ReentrancyGuard {
     uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18;
     uint256 private constant DOLLAR_TO_MKD_RATIO = 55;
+    uint256 private constant LIQUIDATION_THRESHOLD = 50;
+    uint256 private constant LIQUIDATION_PRECISION = 100;
+    uint256 private constant MIN_HEALTH_FACTOR = 1;
+
     mapping(address token => address priceFeed) private s_priceFeeds; //tokenToPriceFeed
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
     mapping(address user => uint256 amountMKDMinted) private s_MKDMinted;
@@ -135,7 +141,12 @@ contract MKDEngine is ReentrancyGuard {
      */
     function mintMKD(uint256 amountMKDToMint) external moreThanZero(amountMKDToMint) nonReentrant {
         s_MKDMinted[msg.sender] += amountMKDToMint;
+        //if they minted too much ($150 MKD, $100 ETH)
         _revertIfHealthFactorIsBroken(msg.sender);
+        bool minted = i_MKD.mint(msg.sender, amountMKDToMint);
+        if (!minted) {
+            revert MKDEngine__MintFailed();
+        }
     }
 
     function redeemCollateralForMKD() external {}
@@ -165,9 +176,19 @@ contract MKDEngine is ReentrancyGuard {
      */
     function _healthFactor(address user) private view returns (uint256) {
         (uint256 totalMKDMinted, uint256 collateralValueInMKD) = _getUserAccountInformation(user);
+        uint256 collateralAdjustedForThreshold = (collateralValueInMKD * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
+        //E.g. 55 000 DEN ($1000) ETH / 100 DSC
+        // 55000 * 50 = 1100 / 100 = (11 / 100) > 1
+
+        return (collateralAdjustedForThreshold * PRECISION) / totalMKDMinted;
     }
 
-    function _revertIfHealthFactorIsBroken(address user) internal view {}
+    function _revertIfHealthFactorIsBroken(address user) internal view {
+        uint256 userHealthFactor = _healthFactor(user);
+        if (userHealthFactor < MIN_HEALTH_FACTOR) {
+            revert MKDEngine_BreaksHealthFactor(userHealthFactor);
+        }
+    }
 
     /**
      * Public & External View Functions
@@ -183,7 +204,9 @@ contract MKDEngine is ReentrancyGuard {
 
     function getMkdValue(address token, uint256 amount) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
-        return (((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION) * DOLLAR_TO_MKD_RATIO;
+        (, int256 price,,,) = priceFeed.getRoundData(0);
+        uint256 usdPrice = uint256(price);
+        uint256 mkdPrice = (usdPrice * DOLLAR_TO_MKD_RATIO * ADDITIONAL_FEED_PRECISION);
+        return ((mkdPrice * amount) / PRECISION);
     }
 }
