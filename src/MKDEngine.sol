@@ -52,6 +52,8 @@ contract MKDEngine is ReentrancyGuard {
     error MKDEngine__DepositCollateralFailed();
     error MKDEngine_BreaksHealthFactor(uint256 healthFactor);
     error MKDEngine__MintFailed();
+    error MKDEngine__TransferFailed();
+    error MKDEngine__HealthFactorIsOkay();
 
     /**
      * State Variables
@@ -61,7 +63,7 @@ contract MKDEngine is ReentrancyGuard {
     uint256 private constant DOLLAR_TO_MKD_RATIO = 55;
     uint256 private constant LIQUIDATION_THRESHOLD = 50;
     uint256 private constant LIQUIDATION_PRECISION = 100;
-    uint256 private constant MIN_HEALTH_FACTOR = 1;
+    uint256 private constant MIN_HEALTH_FACTOR = 1e18;
 
     mapping(address token => address priceFeed) private s_priceFeeds; //tokenToPriceFeed
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
@@ -74,6 +76,7 @@ contract MKDEngine is ReentrancyGuard {
      * Events
      */
     event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
+    event CollateralRedeemed(address indexed user, address indexed token, uint256 amount);
 
     /**
      * Modifiers
@@ -111,7 +114,21 @@ contract MKDEngine is ReentrancyGuard {
     /**
      * External Functions
      */
-    function depositCollateralAndMintMKD() external {}
+
+    /**
+     * @notice follows CEI
+     * @param amountMKDToMint The amount of decentralized stablecoin to mint
+     * @notice they must have more collateral value than the minimum threshold
+     */
+    function mintMKD(uint256 amountMKDToMint) public moreThanZero(amountMKDToMint) nonReentrant {
+        s_MKDMinted[msg.sender] += amountMKDToMint;
+        //if they minted too much ($150 MKD, $100 ETH)
+        _revertIfHealthFactorIsBroken(msg.sender);
+        bool minted = i_MKD.mint(msg.sender, amountMKDToMint);
+        if (!minted) {
+            revert MKDEngine__MintFailed();
+        }
+    }
 
     /*
      * @notice Follows CEI
@@ -119,7 +136,7 @@ contract MKDEngine is ReentrancyGuard {
      * @param amountCollateral The amount of collateral to be deposited
      */
     function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
-        external
+        public
         moreThanZero(amountCollateral)
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
@@ -131,29 +148,83 @@ contract MKDEngine is ReentrancyGuard {
             revert MKDEngine__DepositCollateralFailed();
         }
     }
-
-    function redeemCollateral() external {}
-
     /**
-     * @notice follows CEI
+     * @notice Follows CEI
+     * @param tokenCollateralAddress The address of the ERC20 token to be deposited as collateral
+     * @param amountCollateral The amount of collateral to be deposited
      * @param amountMKDToMint The amount of decentralized stablecoin to mint
      * @notice they must have more collateral value than the minimum threshold
      */
-    function mintMKD(uint256 amountMKDToMint) external moreThanZero(amountMKDToMint) nonReentrant {
-        s_MKDMinted[msg.sender] += amountMKDToMint;
-        //if they minted too much ($150 MKD, $100 ETH)
-        _revertIfHealthFactorIsBroken(msg.sender);
-        bool minted = i_MKD.mint(msg.sender, amountMKDToMint);
-        if (!minted) {
-            revert MKDEngine__MintFailed();
-        }
+
+    function depositCollateralAndMintMKD(
+        address tokenCollateralAddress,
+        uint256 amountCollateral,
+        uint256 amountMKDToMint
+    ) external {
+        depositCollateral(tokenCollateralAddress, amountCollateral);
+        mintMKD(amountMKDToMint);
     }
 
-    function redeemCollateralForMKD() external {}
+    function redeemCollateral(address tokenCollateralAddress, uint256 amountCollateral)
+        public
+        moreThanZero(amountCollateral)
+        nonReentrant
+    {
+        s_collateralDeposited[msg.sender][tokenCollateralAddress] -= amountCollateral;
+        emit CollateralRedeemed(msg.sender, tokenCollateralAddress, amountCollateral);
+        bool success = IERC20(tokenCollateralAddress).transfer(msg.sender, amountCollateral);
+        if (!success) {
+            revert MKDEngine__TransferFailed();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
-    function burnMKD() external {}
+    /**
+     * @param tokenCollateralAddress The collateral address to redeem
+     * @param amountCollateral The amount of collateral to redeem
+     * @param amountMKDToBurn The amount of MKD stable coin to burn
+     * This function burns MKD and redeems underlyning collateral in one transaction
+     */
+    function redeemCollateralForMKD(address tokenCollateralAddress, uint256 amountCollateral, uint256 amountMKDToBurn)
+        external
+    {
+        burnMKD(amountMKDToBurn);
+        redeemCollateral(tokenCollateralAddress, amountCollateral);
+    }
 
-    function liquadate() external {}
+    function burnMKD(uint256 amount) public moreThanZero(amount) {
+        s_MKDMinted[msg.sender] -= amount;
+        bool success = i_MKD.transferFrom(msg.sender, address(this), amount);
+        if (!success) {
+            revert MKDEngine__TransferFailed();
+        }
+        i_MKD.burn(amount);
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
+
+    /**
+     * @param collateral The ERC20 collateral address to liquidate from the user
+     * @param user The user to liquidate / has broken the health factor
+     * @param debtToCover The amount of MKD stablecoin to cover
+     * @notice You can partially liquidate a user
+     * @notice You will get a liquidation bonus for taking the users funds
+     * @notice This function working assumes the protocol will be roughly 200% overcollateralized in order for this to work
+     * @notice A known bug would be if the protocol were 100% or less collateralized, then we wouldn't be able to incentive the liquidators
+     * For example, if the price of the collateral plummeted before anyone could be liquidated.
+     */
+    function liquadate(address collateral, address user, uint256 debtToCover)
+        external
+        moreThanZero(debtToCover)
+        nonReentrant
+    {
+        uint256 startingUserHealthFactor = _healthFactor(user);
+        if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
+            revert MKDEngine__HealthFactorIsOkay();
+        }
+        //Bad User: 14 000 denars worth of ETH, 10 000 denars worth of MKD
+        //debtToCover = 10 000
+        uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(collateral, debtToCover);
+    }
 
     function getHealthFactior() external view {}
 
@@ -193,6 +264,12 @@ contract MKDEngine is ReentrancyGuard {
     /**
      * Public & External View Functions
      */
+
+    function getTokenAmountFromUsd(address token, uint256 usdAmountInWei) public view returns (uint256) {
+        //price of ETH(token)
+        //
+    }
+
     function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValueInMKD) {
         for (uint256 i = 0; i < s_collateralTokens.length; i++) {
             address token = s_collateralTokens[i];
@@ -204,8 +281,8 @@ contract MKDEngine is ReentrancyGuard {
 
     function getMkdValue(address token, uint256 amount) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.getRoundData(0);
-        uint256 usdPrice = uint256(price);
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        uint256 usdPrice = uint256(price); //
         uint256 mkdPrice = (usdPrice * DOLLAR_TO_MKD_RATIO * ADDITIONAL_FEED_PRECISION);
         return ((mkdPrice * amount) / PRECISION);
     }
