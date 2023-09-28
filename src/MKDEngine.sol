@@ -26,6 +26,7 @@ import {MacedonianStandard} from "../src/MacedonianStandard.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {OracleLib} from "../src/libraries/OracleLib.sol";
 
 /**
  * @author  Ilija Ristovski
@@ -43,27 +44,34 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/Ag
  */
 
 contract MKDEngine is ReentrancyGuard {
-    /**
-     * Errors
-     */
+    ////////////////////////////////////
+    // Errors                          //
+    ////////////////////////////////////
     error MKDEngine__AmountMustBeMoreThanZero();
     error MKDEngine__TokenAddressesAndPriceFeedADdressesMustBeSameLength();
     error MKDEngine__TokenIsNotAllowed();
     error MKDEngine__DepositCollateralFailed();
-    error MKDEngine_BreaksHealthFactor(uint256 healthFactor);
+    error MKDEngine__BreaksHealthFactor(uint256 healthFactor);
     error MKDEngine__MintFailed();
     error MKDEngine__TransferFailed();
     error MKDEngine__HealthFactorIsOkay();
+    error MKDEngine__HealthFactorDidNotImprove();
 
-    /**
-     * State Variables
-     */
+    ////////////////////////////////////
+    // Types                          //
+    ////////////////////////////////////
+    using OracleLib for AggregatorV3Interface;
+
+    ////////////////////////////////////
+    // State Variables                  //
+    ////////////////////////////////////
     uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18;
     uint256 private constant DOLLAR_TO_MKD_RATIO = 55;
     uint256 private constant LIQUIDATION_THRESHOLD = 50;
     uint256 private constant LIQUIDATION_PRECISION = 100;
     uint256 private constant MIN_HEALTH_FACTOR = 1e18;
+    uint256 private constant LIQUIDATION_BONUS = 10;
 
     mapping(address token => address priceFeed) private s_priceFeeds; //tokenToPriceFeed
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
@@ -72,15 +80,17 @@ contract MKDEngine is ReentrancyGuard {
 
     MacedonianStandard private immutable i_MKD;
 
-    /**
-     * Events
-     */
+    ////////////////////////////////////
+    // Events                           //
+    ////////////////////////////////////
     event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
-    event CollateralRedeemed(address indexed user, address indexed token, uint256 amount);
+    event CollateralRedeemed(
+        address indexed redeemedFrom, address indexed redeemedTo, address indexed token, uint256 amount
+    );
 
-    /**
-     * Modifiers
-     */
+    ////////////////////////////////////
+    // Modifiers                         //
+    ////////////////////////////////////
     modifier moreThanZero(uint256 amount) {
         if (amount <= 0) {
             revert MKDEngine__AmountMustBeMoreThanZero();
@@ -95,9 +105,9 @@ contract MKDEngine is ReentrancyGuard {
         _;
     }
 
-    /**
-     * Functions
-     */
+    ////////////////////////////////////
+    // Functions                        //
+    ////////////////////////////////////
 
     constructor(address[] memory tokenAddresses, address[] memory priceFeedAddresses, address mkdAddress) {
         if (tokenAddresses.length != priceFeedAddresses.length) {
@@ -111,9 +121,9 @@ contract MKDEngine is ReentrancyGuard {
         i_MKD = MacedonianStandard(mkdAddress);
     }
 
-    /**
-     * External Functions
-     */
+    ////////////////////////////////////
+    // External Functions               //
+    ////////////////////////////////////
 
     /**
      * @notice follows CEI
@@ -170,12 +180,7 @@ contract MKDEngine is ReentrancyGuard {
         moreThanZero(amountCollateral)
         nonReentrant
     {
-        s_collateralDeposited[msg.sender][tokenCollateralAddress] -= amountCollateral;
-        emit CollateralRedeemed(msg.sender, tokenCollateralAddress, amountCollateral);
-        bool success = IERC20(tokenCollateralAddress).transfer(msg.sender, amountCollateral);
-        if (!success) {
-            revert MKDEngine__TransferFailed();
-        }
+        _redeemCollateral(msg.sender, msg.sender, tokenCollateralAddress, amountCollateral);
         _revertIfHealthFactorIsBroken(msg.sender);
     }
 
@@ -193,12 +198,7 @@ contract MKDEngine is ReentrancyGuard {
     }
 
     function burnMKD(uint256 amount) public moreThanZero(amount) {
-        s_MKDMinted[msg.sender] -= amount;
-        bool success = i_MKD.transferFrom(msg.sender, address(this), amount);
-        if (!success) {
-            revert MKDEngine__TransferFailed();
-        }
-        i_MKD.burn(amount);
+        _burnMKD(msg.sender, msg.sender, amount);
         _revertIfHealthFactorIsBroken(msg.sender);
     }
 
@@ -212,7 +212,7 @@ contract MKDEngine is ReentrancyGuard {
      * @notice A known bug would be if the protocol were 100% or less collateralized, then we wouldn't be able to incentive the liquidators
      * For example, if the price of the collateral plummeted before anyone could be liquidated.
      */
-    function liquadate(address collateral, address user, uint256 debtToCover)
+    function liquidate(address collateral, address user, uint256 debtToCover)
         external
         moreThanZero(debtToCover)
         nonReentrant
@@ -223,14 +223,47 @@ contract MKDEngine is ReentrancyGuard {
         }
         //Bad User: 14 000 denars worth of ETH, 10 000 denars worth of MKD
         //debtToCover = 10 000
-        uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(collateral, debtToCover);
+        uint256 tokenAmountFromDebtCovered = getTokenAmountFromDenar(collateral, debtToCover);
+        uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+        uint256 totalCollateralToRedeem = tokenAmountFromDebtCovered + bonusCollateral;
+        _redeemCollateral(user, msg.sender, collateral, totalCollateralToRedeem);
+        _burnMKD(user, msg.sender, debtToCover);
+        uint256 endingUserHealthFactor = _healthFactor(user);
+        if (endingUserHealthFactor <= startingUserHealthFactor) {
+            revert MKDEngine__HealthFactorDidNotImprove();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
     }
 
     function getHealthFactior() external view {}
 
+    ////////////////////////////////////
+    // Private & Internal View Functions //
+    ////////////////////////////////////
+
     /**
-     * Private & Internal View Functions
+     * @dev Low-level internal function, do not call unless the function calling it is checking for health factors being broken
      */
+    function _burnMKD(address onBehalfOf, address mkdFrom, uint256 amountMKDToBurn) private {
+        s_MKDMinted[onBehalfOf] -= amountMKDToBurn;
+        bool success = i_MKD.transferFrom(mkdFrom, address(this), amountMKDToBurn);
+        if (!success) {
+            revert MKDEngine__TransferFailed();
+        }
+        i_MKD.burn(amountMKDToBurn);
+    }
+
+    function _redeemCollateral(address from, address to, address tokenCollateralAddress, uint256 amountCollateral)
+        private
+    {
+        s_collateralDeposited[from][tokenCollateralAddress] -= amountCollateral;
+        emit CollateralRedeemed(from, to, tokenCollateralAddress, amountCollateral);
+        bool success = IERC20(tokenCollateralAddress).transfer(to, amountCollateral);
+        if (!success) {
+            revert MKDEngine__TransferFailed();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     function _getUserAccountInformation(address userAddress)
         private
@@ -254,20 +287,50 @@ contract MKDEngine is ReentrancyGuard {
         return (collateralAdjustedForThreshold * PRECISION) / totalMKDMinted;
     }
 
+    function _calculateHealthFactor(uint256 totalMKDMinted, uint256 collateralValueInDenar)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (totalMKDMinted == 0) {
+            return type(uint256).max;
+        }
+        uint256 collateralAdjustedForThreshold =
+            (collateralValueInDenar * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
+        return (collateralAdjustedForThreshold * 1e18) / totalMKDMinted;
+    }
+
     function _revertIfHealthFactorIsBroken(address user) internal view {
         uint256 userHealthFactor = _healthFactor(user);
         if (userHealthFactor < MIN_HEALTH_FACTOR) {
-            revert MKDEngine_BreaksHealthFactor(userHealthFactor);
+            revert MKDEngine__BreaksHealthFactor(userHealthFactor);
         }
     }
 
-    /**
-     * Public & External View Functions
-     */
+    ////////////////////////////////////
+    // Public & External View Functions //
+    ////////////////////////////////////
 
-    function getTokenAmountFromUsd(address token, uint256 usdAmountInWei) public view returns (uint256) {
+    function calculateHealthFactor(uint256 totalMKDMinted, uint256 collateralValueInDenar)
+        external
+        pure
+        returns (uint256)
+    {
+        return _calculateHealthFactor(totalMKDMinted, collateralValueInDenar);
+    }
+
+    /////////////////////////////////
+    //////Get Functions//////////////
+    /////////////////////////////////
+
+    function getTokenAmountFromDenar(address token, uint256 denarAmountInWei) public view returns (uint256) {
         //price of ETH(token)
         //
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
+        (, int256 price,,,) = priceFeed.staleCheckLatestRoundData();
+        // (denar60 000e18 * 1e18) / (2000e8 * 55 * 1e10)
+
+        return (denarAmountInWei * PRECISION) / (uint256(price) * ADDITIONAL_FEED_PRECISION);
     }
 
     function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValueInMKD) {
@@ -281,9 +344,29 @@ contract MKDEngine is ReentrancyGuard {
 
     function getMkdValue(address token, uint256 amount) public view returns (uint256) {
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
-        (, int256 price,,,) = priceFeed.latestRoundData();
+        (, int256 price,,,) = priceFeed.staleCheckLatestRoundData();
         uint256 usdPrice = uint256(price); //
         uint256 mkdPrice = (usdPrice * DOLLAR_TO_MKD_RATIO * ADDITIONAL_FEED_PRECISION);
         return ((mkdPrice * amount) / PRECISION);
+    }
+
+    function getUserAccountInformation(address user)
+        external
+        view
+        returns (uint256 totalMKDMinted, uint256 collateralValueInMKD)
+    {
+        (totalMKDMinted, collateralValueInMKD) = _getUserAccountInformation(user);
+    }
+
+    function getCollateralTokens() external view returns (address[] memory) {
+        return s_collateralTokens;
+    }
+
+    function getCollateralBalanceOfUser(address user, address token) external view returns (uint256) {
+        return s_collateralDeposited[user][token];
+    }
+
+    function getCollateralTokenPriceFeed(address token) external view returns (address) {
+        return s_priceFeeds[token];
     }
 }
