@@ -1,6 +1,6 @@
 # Macedonian Standard Stablecoin System
 
-![Alt text](https://imgur.com/2u3B8cf)
+![Alt text](https://imgur.com/a/FlE74Vi)
 
 Welcome to the official repository for the Macedonian Standard Stablecoin system, a decentralized stable coin linked to the Macedonian Denar. This project is authored and maintained by Ilija Ristovski.
 
