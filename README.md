@@ -40,7 +40,7 @@ This decentralized stablecoin is designed to provide relative stability by being
 To explore and contribute to the Macedonian Standard Stablecoin system, follow these steps:
 
 1. Clone the repository: `git clone https://github.com/ileristovski1/msss.git`
-2. Install dependencies: `npm install`
+2. Install dependencies: `forge install`
 3. Explore the codebase and documentation to understand the system architecture.
 
 Feel free to reach out to Ilija Ristovski for any questions or collaboration opportunities.
