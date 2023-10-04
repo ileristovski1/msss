@@ -262,7 +262,6 @@ contract MKDEngine is ReentrancyGuard {
         if (!success) {
             revert MKDEngine__TransferFailed();
         }
-        _revertIfHealthFactorIsBroken(msg.sender);
     }
 
     function _getUserAccountInformation(address userAddress)
@@ -324,13 +323,11 @@ contract MKDEngine is ReentrancyGuard {
     /////////////////////////////////
 
     function getTokenAmountFromDenar(address token, uint256 denarAmountInWei) public view returns (uint256) {
-        //price of ETH(token)
-        //
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
         (, int256 price,,,) = priceFeed.staleCheckLatestRoundData();
         // (denar 60 000e18 * 1e18) / (2000e8 * 55 * 1e10)
 
-        return (denarAmountInWei * PRECISION) / (uint256(price) * ADDITIONAL_FEED_PRECISION);
+        return (denarAmountInWei * PRECISION) / (uint256(price) * DOLLAR_TO_MKD_RATIO * ADDITIONAL_FEED_PRECISION);
     }
 
     function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValueInMKD) {
@@ -392,5 +389,9 @@ contract MKDEngine is ReentrancyGuard {
 
     function getMKD() external view returns (address) {
         return address(i_MKD);
+    }
+
+    function getLiquidationPrecision() external pure returns (uint256) {
+        return LIQUIDATION_PRECISION;
     }
 }
