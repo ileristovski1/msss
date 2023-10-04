@@ -65,6 +65,8 @@ contract MKDEngine is ReentrancyGuard {
     ////////////////////////////////////
     // State Variables                  //
     ////////////////////////////////////
+    MacedonianStandard private immutable i_MKD;
+
     uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18;
     uint256 private constant DOLLAR_TO_MKD_RATIO = 55;
@@ -78,10 +80,8 @@ contract MKDEngine is ReentrancyGuard {
     mapping(address user => uint256 amountMKDMinted) private s_MKDMinted;
     address[] private s_collateralTokens;
 
-    MacedonianStandard private immutable i_MKD;
-
     ////////////////////////////////////
-    // Events                           //
+    // Events                         //
     ////////////////////////////////////
     event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
     event CollateralRedeemed(
@@ -89,7 +89,7 @@ contract MKDEngine is ReentrancyGuard {
     );
 
     ////////////////////////////////////
-    // Modifiers                         //
+    // Modifiers                      //
     ////////////////////////////////////
     modifier moreThanZero(uint256 amount) {
         if (amount <= 0) {
@@ -328,7 +328,7 @@ contract MKDEngine is ReentrancyGuard {
         //
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
         (, int256 price,,,) = priceFeed.staleCheckLatestRoundData();
-        // (denar60 000e18 * 1e18) / (2000e8 * 55 * 1e10)
+        // (denar 60 000e18 * 1e18) / (2000e8 * 55 * 1e10)
 
         return (denarAmountInWei * PRECISION) / (uint256(price) * ADDITIONAL_FEED_PRECISION);
     }
@@ -368,5 +368,29 @@ contract MKDEngine is ReentrancyGuard {
 
     function getCollateralTokenPriceFeed(address token) external view returns (address) {
         return s_priceFeeds[token];
+    }
+
+    function getPrecision() external pure returns (uint256) {
+        return PRECISION;
+    }
+
+    function getAdditionalFeedPrecision() external pure returns (uint256) {
+        return ADDITIONAL_FEED_PRECISION;
+    }
+
+    function getLiquidationThreshold() external pure returns (uint256) {
+        return LIQUIDATION_THRESHOLD;
+    }
+
+    function getLiquidationBonus() external pure returns (uint256) {
+        return LIQUIDATION_BONUS;
+    }
+
+    function getMinHealthFactor() external pure returns (uint256) {
+        return MIN_HEALTH_FACTOR;
+    }
+
+    function getMKD() external view returns (address) {
+        return address(i_MKD);
     }
 }
